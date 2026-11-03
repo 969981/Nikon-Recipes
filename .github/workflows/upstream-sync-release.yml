@@ -1,0 +1,228 @@
+name: Sync Nikon Recipes upstream and publish ZIP
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Rebuild the current upstream snapshot even if unchanged
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nikon-recipes-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync shouryan01/Nikon-Recipes main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      short_sha: ${{ steps.sync.outputs.short_sha }}
+      sync_sha: ${{ steps.sync.outputs.sync_sha }}
+    steps:
+      - name: Checkout main with complete history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Compare and safely import upstream recipes
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add recipes-upstream https://github.com/shouryan01/Nikon-Recipes.git
+          git fetch --no-tags recipes-upstream +refs/heads/main:refs/remotes/recipes-upstream/main
+          before="$(git rev-parse HEAD)"
+          upstream="$(git rev-parse refs/remotes/recipes-upstream/main)"
+          previous="$(git show "$before:.nikon-upstream-sha" 2>/dev/null || true)"
+
+          echo "source_sha=$upstream" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${upstream:0:12}" >> "$GITHUB_OUTPUT"
+          if [[ "$previous" == "$upstream" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sync_sha=$before" >> "$GITHUB_OUTPUT"
+            echo "Upstream main unchanged: $upstream"
+            exit 0
+          fi
+
+          # Fail closed if the upstream history is rewritten or if someone edited
+          # tracked recipe data directly in this branch. Only local CI and the
+          # sync marker are reserved for this repository.
+          if [[ -n "$previous" ]]; then
+            git cat-file -e "$previous^{commit}" || {
+              echo "::error::Previous upstream commit is unavailable; refusing unsafe sync."
+              exit 1
+            }
+            if ! git merge-base --is-ancestor "$previous" "$upstream"; then
+              echo "::error::Upstream history was rewritten; manual review required."
+              exit 1
+            fi
+            reference="$previous"
+          else
+            reference="$(git merge-base "$before" "$upstream")" || {
+              echo "::error::No common history with the upstream repository."
+              exit 1
+            }
+          fi
+          if ! git diff --quiet "$reference" "$before" -- . \
+              ':(exclude).github/workflows' ':(exclude).nikon-upstream-sha'; then
+            echo "::error::Local recipe edits detected outside the controller workflow; refusing to overwrite."
+            git diff --name-only "$reference" "$before" -- . \
+              ':(exclude).github/workflows' ':(exclude).nikon-upstream-sha'
+            exit 1
+          fi
+
+          # Import upstream data, but preserve local CI files. GITHUB_TOKEN cannot
+          # modify workflow files, and this also prevents upstream from replacing CI.
+          git read-tree --reset "$upstream^{tree}"
+          git restore --source="$before" --staged -- .github/workflows
+          printf '%s\n' "$upstream" > .nikon-upstream-sha
+          git add .nikon-upstream-sha
+          tree="$(git write-tree)"
+          sync_commit="$(printf 'sync: Nikon-Recipes upstream %s [skip ci]\n' "$upstream" |
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit-tree "$tree" -p "$before")"
+          git push origin "$sync_commit:refs/heads/main"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "sync_sha=$sync_commit" >> "$GITHUB_OUTPUT"
+          echo "Synced upstream $upstream as local commit $sync_commit"
+
+  package:
+    name: Validate and package all original recipe files
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout synchronized recipe snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sync_sha }}
+          persist-credentials: false
+
+      - name: Create deterministic recipe ZIP, manifest, and SHA-256 checksums
+        env:
+          UPSTREAM_SHA: ${{ needs.sync.outputs.source_sha }}
+          SHORT_SHA: ${{ needs.sync.outputs.short_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          source = os.environ["UPSTREAM_SHA"]
+          short = os.environ["SHORT_SHA"]
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).split(b"\0")
+          paths = sorted(Path(os.fsdecode(p)) for p in tracked if p)
+          paths = [p for p in paths
+                   if not p.as_posix().startswith(".github/")
+                   and p.as_posix() != ".nikon-upstream-sha"]
+          if not paths or not Path("README.md").is_file():
+              raise SystemExit("The upstream source tree or README is missing")
+          presets = [p for p in paths if p.suffix.lower() in (".np3", ".ncp")]
+          if not presets:
+              raise SystemExit("No Nikon NP3/NCP recipes found; refusing an empty release")
+          manifest = {
+              "upstream": "https://github.com/shouryan01/Nikon-Recipes",
+              "branch": "main",
+              "source_sha": source,
+              "preset_count": len(presets),
+              "presets": [{
+                  "path": p.as_posix(),
+                  "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+                  "bytes": p.stat().st_size
+              } for p in presets]
+          }
+          archive = Path("release") / f"Nikon-Recipes-{short}.zip"
+          with ZipFile(archive, "w", compression=ZIP_DEFLATED, compresslevel=9) as z:
+              for p in paths:
+                  if not p.is_file():
+                      raise SystemExit(f"Tracked file unavailable: {p}")
+                  z.write(p, arcname="Nikon-Recipes/" + p.as_posix())
+              z.writestr("Nikon-Recipes/RECIPE-MANIFEST.json",
+                         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+          with ZipFile(archive) as z:
+              if z.testzip() is not None:
+                  raise SystemExit("Archive CRC check failed")
+              expected = len(paths) + 1
+              if len(z.namelist()) != expected:
+                  raise SystemExit("Archive entries missing")
+          Path("release/RECIPE-MANIFEST.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+          for p in (archive, Path("release/RECIPE-MANIFEST.json")):
+              checksum = hashlib.sha256(p.read_bytes()).hexdigest()
+              with Path("release/SHA256SUMS.txt").open("a") as out:
+                  out.write(f"{checksum}  {p.name}\n")
+          Path("release/BUILD-INFO.txt").write_text(
+              f"Source: https://github.com/shouryan01/Nikon-Recipes\n"
+              f"Branch: main\nCommit: {source}\n"
+              f"Presets (.NP3/.NCP): {len(presets)}\n"
+              "No compilation required: all files are packaged unchanged.\n")
+          print(f"Validated {len(presets)} presets; {len(paths)} tracked files packaged.")
+          PY
+
+      - name: Upload validated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: nikon-recipes-release
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish recipe snapshot Release
+    needs: [sync, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated archive
+        uses: actions/download-artifact@v4
+        with:
+          name: nikon-recipes-release
+          path: release
+
+      - name: Publish GitHub Release (only changed upstream revisions)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: upstream-${{ needs.sync.outputs.short_sha }}
+          name: Nikon Recipes upstream ${{ needs.sync.outputs.short_sha }}
+          target_commitish: ${{ needs.sync.outputs.sync_sha }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          body: |
+            Automatic snapshot of [shouryan01/Nikon-Recipes](https://github.com/shouryan01/Nikon-Recipes) `main`.
+
+            Original source SHA: `${{ needs.sync.outputs.source_sha }}`.
+
+            Download the ZIP for all recipe files (.NP3/.NCP) with their original folder structure and README.
+            `RECIPE-MANIFEST.json` contains per-preset SHA-256 hashes; `SHA256SUMS.txt` verifies the downloads.
+            No source code is compiled or camera settings altered by this workflow.
+          files: |
+            release/Nikon-Recipes-*.zip
+            release/RECIPE-MANIFEST.json
+            release/SHA256SUMS.txt
+            release/BUILD-INFO.txt
